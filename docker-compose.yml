@@ -1,0 +1,145 @@
+version: '3.8'
+
+services:
+  autowiper:
+    build: .
+    container_name: autowiper-bot
+    restart: unless-stopped
+    environment:
+      # Telegram API Credentials
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - BOT_TOKEN=${BOT_TOKEN}
+      - SESSION=${SESSION}
+      
+      # Chat Configuration
+      - CHAT_IDS=${CHAT_IDS}
+      - DELETE_TIMERS=${DELETE_TIMERS:-}
+      
+      # Logging & Performance
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CLEANUP_INTERVAL_MINUTES=${CLEANUP_INTERVAL_MINUTES:-4}
+      - MAX_MESSAGE_HISTORY_HOURS=${MAX_MESSAGE_HISTORY_HOURS:-24}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-300}
+      
+      # Environment
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - TZ=UTC
+    
+    # Volume mounts for persistence (optional)
+    volumes:
+      - ./logs:/app/logs:rw
+      - ./data:/app/data:rw
+    
+    # Health check
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import requests; requests.get(\"http://localhost:8000/health\", timeout=5)' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+        reservations:
+          memory: 128M
+          cpus: '0.25'
+    
+    # Network configuration
+    networks:
+      - autowiper-network
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Redis for caching and job persistence
+  redis:
+    image: redis:7-alpine
+    container_name: autowiper-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - autowiper-network
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.2'
+    profiles:
+      - redis
+
+  # Optional: Health check web server
+  healthcheck:
+    build: .
+    container_name: autowiper-healthcheck
+    restart: unless-stopped
+    environment:
+      - PORT=8000
+    ports:
+      - "8000:8000"
+    command: python -m http.server 8000
+    networks:
+      - autowiper-network
+    profiles:
+      - monitoring
+
+networks:
+  autowiper-network:
+    driver: bridge
+    name: autowiper-network
+
+volumes:
+  redis-data:
+    name: autowiper-redis-data
+
+# ==============================================
+# Usage Instructions:
+# ==============================================
+#
+# 1. Basic setup:
+#    docker-compose up -d
+#
+# 2. With Redis caching:
+#    docker-compose --profile redis up -d
+#
+# 3. With monitoring:
+#    docker-compose --profile monitoring up -d
+#
+# 4. Full setup (all services):
+#    docker-compose --profile redis --profile monitoring up -d
+#
+# 5. View logs:
+#    docker-compose logs -f autowiper
+#
+# 6. Stop services:
+#    docker-compose down
+#
+# 7. Update and restart:
+#    docker-compose down
+#    docker-compose pull
+#    docker-compose up -d
+#
+# ==============================================
+# Development Commands:
+# ==============================================
+#
+# Build and run in development mode:
+# docker-compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+# Run tests:
+# docker-compose exec autowiper python -m pytest
+#
+# Access container shell:
+# docker-compose exec autowiper /bin/bash
+#
+# ==============================================
