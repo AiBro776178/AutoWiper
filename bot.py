@@ -303,10 +303,13 @@ async def handle_callback(client, callback_query):
     elif data == "add_channel":
         PENDING[uid] = "add_channel"
         text = (
-            "📥 **Add a Channel**\n\n"
-            "Send the channel/group ID, or forward any message from it.\n\n"
+            "📥 **Add Channel(s)**\n\n"
+            "Send channel/group ID(s), or forward a message from one.\n\n"
+            "✨ You can add multiple at once — separate IDs with a comma:\n"
+            "`-1004490369392,-1001234567890`\n"
+            "No limit, add as many as you want.\n\n"
             "⚠️ Make sure the userbot account is already a member "
-            "(admin, so it can delete messages) of that channel/group.\n\n"
+            "(admin, so it can delete messages) of each channel/group.\n\n"
             "Send /cancel to cancel."
         )
         await callback_query.message.edit_text(text)
@@ -363,47 +366,87 @@ async def handle_pending_input(client, message):
         return
 
     if action == "add_channel":
-        chat_id = None
-        title = None
-
+        # Case 1: user forwarded a message from a single channel/group.
         if message.forward_from_chat:
             chat_id = message.forward_from_chat.id
             title = message.forward_from_chat.title or str(chat_id)
-        elif message.text:
-            txt = message.text.strip()
+
             try:
-                chat_id = int(txt)
-            except ValueError:
+                chat = await user.get_chat(chat_id)
+                title = chat.title or title or str(chat_id)
+                chat_id = chat.id
+            except Exception as e:
                 await message.reply_text(
-                    "❌ Invalid input. Send a numeric channel/group ID, or forward a message "
-                    "from it. Send /cancel to cancel."
+                    "❌ Couldn't access that chat. Make sure the userbot account is a member "
+                    f"of it and the ID is correct.\n`{e}`"
                 )
                 return
-        else:
+
+            try:
+                await storage.add_channel(uid, chat_id, title)
+            except Exception as e:
+                logger.error(f"💥 Mongo add_channel failed: {e}")
+                await message.reply_text("❌ Database error while saving. Please try again.")
+                return
+
+            PENDING.pop(uid, None)
+            await message.reply_text(f"✅ Channel **{title}** (`{chat_id}`) added successfully!")
+            return
+
+        # Case 2: user sent one or more channel/group IDs, comma-separated.
+        # e.g. -1004490369392  OR  -1004490369392,-1001234567890,-1009876543210
+        if not message.text:
             await message.reply_text(
-                "❌ Please send the channel ID as text, or forward a message from the channel."
+                "❌ Please send the channel ID(s) as text (comma-separated for multiple), "
+                "or forward a message from the channel."
             )
             return
 
-        try:
-            chat = await user.get_chat(chat_id)
-            title = chat.title or title or str(chat_id)
-            chat_id = chat.id
-        except Exception as e:
+        raw_ids = [part.strip() for part in message.text.strip().split(",") if part.strip()]
+        if not raw_ids:
             await message.reply_text(
-                "❌ Couldn't access that chat. Make sure the userbot account is a member "
-                f"of it and the ID is correct.\n`{e}`"
+                "❌ Invalid input. Send numeric channel/group ID(s), separated by commas "
+                "if more than one. Send /cancel to cancel."
             )
             return
 
-        try:
-            await storage.add_channel(uid, chat_id, title)
-        except Exception as e:
-            logger.error(f"💥 Mongo add_channel failed: {e}")
-            await message.reply_text("❌ Database error while saving. Please try again.")
-            return
+        added, failed, invalid = [], [], []
+
+        for raw_id in raw_ids:
+            try:
+                cid = int(raw_id)
+            except ValueError:
+                invalid.append(raw_id)
+                continue
+
+            try:
+                chat = await user.get_chat(cid)
+                title = chat.title or str(chat.id)
+                cid = chat.id
+            except Exception as e:
+                failed.append(f"`{raw_id}` — {e}")
+                continue
+
+            try:
+                await storage.add_channel(uid, cid, title)
+            except Exception as e:
+                logger.error(f"💥 Mongo add_channel failed: {e}")
+                failed.append(f"`{raw_id}` — database error")
+                continue
+
+            added.append(f"✅ **{title}** (`{cid}`)")
+
         PENDING.pop(uid, None)
-        await message.reply_text(f"✅ Channel **{title}** (`{chat_id}`) added successfully!")
+
+        lines = []
+        if added:
+            lines.append(f"**Added ({len(added)}):**\n" + "\n".join(added))
+        if failed:
+            lines.append(f"**Failed ({len(failed)}):**\n" + "\n".join(failed))
+        if invalid:
+            lines.append(f"**Invalid IDs ({len(invalid)}):**\n" + "\n".join(f"`{x}`" for x in invalid))
+
+        await message.reply_text("\n\n".join(lines) if lines else "❌ Nothing was added.")
 
     elif action == "set_time":
         seconds = parse_ddhhmmss(message.text or "")
