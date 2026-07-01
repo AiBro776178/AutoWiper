@@ -16,7 +16,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import storage
 from config import (
-    API_ID, API_HASH, BOT_TOKEN, SESSION,
+    API_ID, API_HASH, BOT_TOKEN,
     OWNER_IDS, AUTH_USERS, DEFAULT_DELETE_SECONDS,
 )
 
@@ -69,7 +69,6 @@ start_time = datetime.now()
 
 scheduler = None
 app = None
-user = None
 shutdown_event = None
 
 # In-memory "what is this user currently doing in the /set flow" tracker.
@@ -308,8 +307,8 @@ async def handle_callback(client, callback_query):
             "✨ You can add multiple at once — separate IDs with a comma:\n"
             "`-1004490369392,-1001234567890`\n"
             "No limit, add as many as you want.\n\n"
-            "⚠️ Make sure the userbot account is already a member "
-            "(admin, so it can delete messages) of each channel/group.\n\n"
+            "⚠️ Make sure the **bot** is added as an **admin** (with \"Delete messages\" "
+            "permission) in each channel/group.\n\n"
             "Send /cancel to cancel."
         )
         await callback_query.message.edit_text(text)
@@ -372,13 +371,13 @@ async def handle_pending_input(client, message):
             title = message.forward_from_chat.title or str(chat_id)
 
             try:
-                chat = await user.get_chat(chat_id)
+                chat = await app.get_chat(chat_id)
                 title = chat.title or title or str(chat_id)
                 chat_id = chat.id
             except Exception as e:
                 await message.reply_text(
-                    "❌ Couldn't access that chat. Make sure the userbot account is a member "
-                    f"of it and the ID is correct.\n`{e}`"
+                    "❌ Couldn't access that chat. Make sure the bot is added as an "
+                    "**admin** (with delete permission) in it and the ID is correct.\n`{}`".format(e)
                 )
                 return
 
@@ -420,7 +419,7 @@ async def handle_pending_input(client, message):
                 continue
 
             try:
-                chat = await user.get_chat(cid)
+                chat = await app.get_chat(cid)
                 title = chat.title or str(chat.id)
                 cid = chat.id
             except Exception as e:
@@ -489,7 +488,7 @@ async def heartbeat():
 # ============================================================
 
 async def main():
-    global app, user, scheduler, shutdown_event
+    global app, scheduler, shutdown_event
 
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
@@ -508,10 +507,8 @@ async def main():
         logger.error(f"💥 Failed to load MongoDB cache: {e} — check MONGO_URI. Starting with empty cache.")
 
     app = Client("AutoWiperBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
-    user = Client("UserAutoWiper", api_id=API_ID, api_hash=API_HASH, session_string=SESSION,
-                  in_memory=True, no_updates=False)
 
-    # ── Bot (app) commands — all handled in private chat ──
+    # ── Bot commands — all handled in private chat ──
     app.add_handler(MessageHandler(handle_start, filters=filters.command(["start"]) & filters.private))
     app.add_handler(MessageHandler(handle_set, filters=filters.command(["set"]) & filters.private))
     app.add_handler(MessageHandler(handle_status, filters=filters.command(["status"]) & filters.private))
@@ -525,29 +522,33 @@ async def main():
                 ~filters.command(["start", "set", "status", "ping", "chats"])
     ))
 
-    # ── Userbot (user) — watches monitored chats for media to auto-delete ──
-    user.add_handler(MessageHandler(
+    # ── Watches monitored channels/groups for media to auto-delete ──
+    # The bot must be an admin (with "Delete messages" permission) in each
+    # monitored chat — that's what lets it both see every message there
+    # (privacy mode doesn't apply to admin bots) and delete them directly,
+    # with no userbot/session needed.
+    app.add_handler(MessageHandler(
         handle_media_message,
         filters=filters.media & monitored_media_filter & ~filters.pinned_message
     ))
 
     await app.start()
-    await user.start()
 
-    me = await user.get_me()
-    logger.info(f"🎯 Userbot running as: {me.id} (@{me.username or 'Unknown'})")
+    me = await app.get_me()
+    logger.info(f"🤖 Bot running as: {me.id} (@{me.username or 'Unknown'})")
 
-    try:
-        await user.send_message(
-            me.id,
-            "✅ **Auto-Cleaner Bot Started!**\n\n"
-            f"👑 Owners: `{len(OWNER_IDS)}` | 🔑 Auth Users: `{len(AUTH_USERS)}`\n"
-            f"📊 Monitoring: `{len(storage.get_all_monitored_chats(_authorized_ids()))}` chats\n"
-            f"🗑️ Auto-delete: **media only**, per-user configurable timer (default 4 min)\n"
-            f"✍️ Text messages are never deleted."
-        )
-    except Exception as e:
-        logger.error(f"📩 Failed to send startup message: {e}")
+    if OWNER_IDS:
+        try:
+            await app.send_message(
+                OWNER_IDS[0],
+                "✅ **Auto-Cleaner Bot Started!**\n\n"
+                f"👑 Owners: `{len(OWNER_IDS)}` | 🔑 Auth Users: `{len(AUTH_USERS)}`\n"
+                f"📊 Monitoring: `{len(storage.get_all_monitored_chats(_authorized_ids()))}` chats\n"
+                f"🗑️ Auto-delete: **media only**, per-user configurable timer (default 4 min)\n"
+                f"✍️ Text messages are never deleted."
+            )
+        except Exception as e:
+            logger.error(f"📩 Failed to send startup message: {e}")
 
     heartbeat_task = loop.create_task(heartbeat())
 
@@ -569,11 +570,8 @@ async def main():
             except asyncio.CancelledError:
                 pass
 
-        await asyncio.gather(
-            app.stop() if app and app.is_connected else asyncio.sleep(0),
-            user.stop() if user and user.is_connected else asyncio.sleep(0),
-            return_exceptions=True
-        )
+        if app and app.is_connected:
+            await app.stop()
 
         if scheduler and scheduler.running:
             scheduler.shutdown()

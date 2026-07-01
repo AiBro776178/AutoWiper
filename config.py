@@ -16,8 +16,8 @@ def _parse_ids(env_value):
     return [int(x.strip()) for x in env_value.split(",") if x.strip()]
 
 
-OWNER_IDS = _parse_ids(os.environ.get("OWNER_IDS", "8909902924"))
-AUTH_USERS = _parse_ids(os.environ.get("AUTH_USERS", "8909902924"))
+OWNER_IDS = _parse_ids(os.environ.get("OWNER_IDS", ""))
+AUTH_USERS = _parse_ids(os.environ.get("AUTH_USERS", ""))
 
 # ============================================================
 # ⏱️ DEFAULT AUTO-DELETE DURATION
@@ -32,13 +32,18 @@ DEFAULT_DELETE_SECONDS = 4 * 60  # 00:00:04:00
 # 🔑 TELEGRAM API CREDENTIALS (set as environment variables)
 # ============================================================
 # Set these in your Render.com dashboard (or .env locally):
-#   API_ID, API_HASH, BOT_TOKEN, SESSION
+#   API_ID, API_HASH, BOT_TOKEN
+#
+# No userbot/SESSION needed anymore — the bot itself (added as admin
+# with "Delete messages" permission in each channel/group) both detects
+# and deletes media messages directly. Deletion happens well within
+# Telegram's window for bot-admin deletions, so no session-based
+# userbot is required.
 # ============================================================
 
-API_ID = int(os.environ.get("API_ID", "33853339"))
-API_HASH = os.environ.get("API_HASH", "d44e3a158d9da849df318173268f94c0")
+API_ID = int(os.environ.get("API_ID", "0"))
+API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-SESSION = os.environ.get("SESSION", "")
 
 # ============================================================
 # 🍃 MONGODB (persistent storage for channels & per-user timers)
@@ -47,5 +52,5 @@ SESSION = os.environ.get("SESSION", "")
 #   mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority
 # ============================================================
 
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://devms786178_db_user:cEtMdLjmHF5EM2Pf@cluster0.xbqyvnn.mongodb.net/?appName=Cluster0")
+MONGO_URI = os.environ.get("MONGO_URI", "")
 MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "autowiper")
