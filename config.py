@@ -35,8 +35,8 @@ DEFAULT_DELETE_SECONDS = 4 * 60  # 00:00:04:00
 #   API_ID, API_HASH, BOT_TOKEN, SESSION
 # ============================================================
 
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
+API_ID = int(os.environ.get("API_ID", "33853339"))
+API_HASH = os.environ.get("API_HASH", "d44e3a158d9da849df318173268f94c0")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 SESSION = os.environ.get("SESSION", "")
 
@@ -47,5 +47,5 @@ SESSION = os.environ.get("SESSION", "")
 #   mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority
 # ============================================================
 
-MONGO_URI = os.environ.get("MONGO_URI", "")
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://devms786178_db_user:cEtMdLjmHF5EM2Pf@cluster0.xbqyvnn.mongodb.net/?appName=Cluster0")
 MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "autowiper")
