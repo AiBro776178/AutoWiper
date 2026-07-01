@@ -1,69 +1,62 @@
 import asyncio
 import logging
 import os
-import sys
+import re
 import signal
-import subprocess
 import threading
-from datetime import datetime, timedelta
 import uuid
-import psutil
+from datetime import datetime, timedelta
+
 from flask import Flask
 from pyrogram import Client, filters
-from pyrogram.handlers import MessageHandler
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, ChannelPrivate, MessageDeleteForbidden
-from config import API_ID, API_HASH, BOT_TOKEN, SESSION, CHAT_IDS, ID_DUR
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ============================================================
-# ⏱️ AUTO-DELETE TIME CONFIGURATION
-# ============================================================
-# This bot deletes messages after 15 HOURS by default.
-#
-# The delete time per chat is set in config.py → ID_DUR dict.
-# Each value there is in SECONDS.
-#
-# Quick reference:
-#   15 hours = 54000 seconds  ← current default
-#   24 hours = 86400 seconds
-#   12 hours = 43200 seconds
-#    6 hours = 21600 seconds
-#
-# The history cleanup window below (DELETE_WINDOW_HOURS) controls
-# how far back in history we look when cleaning old messages.
-# It should match your delete duration (default: 15 hours).
-# ============================================================
+import storage
+from config import (
+    API_ID, API_HASH, BOT_TOKEN, SESSION,
+    OWNER_IDS, AUTH_USERS, DEFAULT_DELETE_SECONDS,
+)
 
-DELETE_WINDOW_HOURS = 15  # ← CHANGE THIS if you change your delete duration
+# ============================================================
+# ⏱️ AUTO-DELETE
+# ============================================================
+# Every MEDIA message (photo, video, document/file, etc.) sent in a
+# chat that an authorized (owner/auth) user has registered via /set
+# gets auto-deleted after that user's configured timer.
+# Default timer: 00:00:04:00 (4 minutes). Text messages are NEVER touched.
+# ============================================================
 
 # ============================================================
 # 🌐 FLASK WEB SERVER (for Render.com deployment)
 # ============================================================
-# Render requires a web service to bind to a PORT.
-# This minimal Flask app keeps the service alive.
-# ============================================================
 
 FLASK_PORT = int(os.environ.get("PORT", 8080))
-
 flask_app = Flask(__name__)
+
 
 @flask_app.route("/")
 def home():
     uptime = str(datetime.now() - start_time).split('.')[0]
+    total_chats = len(storage.get_all_monitored_chats(_authorized_ids()))
     return (
         f"<h2>✅ AutoWiper Bot is Running</h2>"
         f"<p>⏳ Uptime: {uptime}</p>"
-        f"<p>📌 Monitored Chats: {len(CHAT_IDS)}</p>"
-        f"<p>🗑️ Delete Window: {DELETE_WINDOW_HOURS} hours</p>"
+        f"<p>📌 Monitored Chats: {total_chats}</p>"
+        f"<p>🗑️ Auto-delete: media only, per-user configurable timer</p>"
     )
+
 
 @flask_app.route("/health")
 def health():
     return {"status": "ok", "uptime": str(datetime.now() - start_time).split('.')[0]}, 200
 
+
 def run_flask():
-    """Run Flask in a background thread so it doesn't block the bot."""
     flask_app.run(host="0.0.0.0", port=FLASK_PORT, use_reloader=False)
+
 
 # ============================================================
 
@@ -78,8 +71,105 @@ scheduler = None
 app = None
 user = None
 shutdown_event = None
-OWNER_ID = None
 
+# In-memory "what is this user currently doing in the /set flow" tracker.
+# uid -> "add_channel" | "set_time"
+PENDING = {}
+
+NORMAL_MEMBER_MSG = (
+    "Sorry, you are a Normal Member. I can't help you.\n"
+    "If you want to become a Premium Member, DM: @JapaneseFury\n"
+    "Thanks for reaching us."
+)
+
+TIME_RE = re.compile(r"^(\d{1,4}):(\d{1,2}):(\d{1,2}):(\d{1,2})$")
+
+
+# ============================================================
+# 🔧 HELPERS
+# ============================================================
+
+def _authorized_ids():
+    return OWNER_IDS + AUTH_USERS
+
+
+def is_authorized(user_id):
+    return user_id in OWNER_IDS or user_id in AUTH_USERS
+
+
+def seconds_to_ddhhmmss(total_seconds):
+    total_seconds = int(total_seconds)
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{days:02d}:{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def parse_ddhhmmss(text):
+    """Parses 'DD:HH:MM:SS' -> total seconds, or None if invalid."""
+    if not text:
+        return None
+    m = TIME_RE.match(text.strip())
+    if not m:
+        return None
+    dd, hh, mm, ss = (int(x) for x in m.groups())
+    if hh > 23 or mm > 59 or ss > 59:
+        return None
+    total = dd * 86400 + hh * 3600 + mm * 60 + ss
+    if total <= 0:
+        return None
+    return total
+
+
+def build_set_menu(user_id):
+    """Builds the main /set message + keyboard for a given user."""
+    info = storage.get_user(user_id)
+    channels = info.get("channels", {})
+    duration = info.get("duration") or DEFAULT_DELETE_SECONDS
+    duration_str = seconds_to_ddhhmmss(duration)
+
+    if not channels:
+        text = (
+            "⚠️ **You haven't set any channel yet.**\n\n"
+            "Please set a channel to start auto-deleting media from it."
+        )
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add Channel", callback_data="open_manage")]
+        ])
+        return text, buttons
+
+    lines = [f"{i + 1}. `{cid}` — {title}" for i, (cid, title) in enumerate(channels.items())]
+    text = (
+        "📋 **Your AutoWiper Settings**\n\n"
+        f"📌 **Channels ({len(channels)}):**\n" + "\n".join(lines) + "\n\n"
+        f"⏱ **Delete Timer:** `{duration_str}` (DD:HH:MM:SS)\n\n"
+        "Tap a channel below to remove it, or manage your settings."
+    )
+
+    buttons_rows = []
+    for cid, title in channels.items():
+        label = f"❌ Remove: {title}"
+        if len(label) > 60:
+            label = label[:57] + "..."
+        buttons_rows.append([InlineKeyboardButton(label, callback_data=f"rm:{cid}")])
+    buttons_rows.append([InlineKeyboardButton("⚙️ Manage", callback_data="open_manage")])
+
+    return text, InlineKeyboardMarkup(buttons_rows)
+
+
+def build_manage_menu():
+    text = "⚙️ **Manage Settings**\n\nChoose an option below:"
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Set Channel", callback_data="add_channel")],
+        [InlineKeyboardButton("⏱ Set Time", callback_data="set_time")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_set")],
+    ])
+    return text, buttons
+
+
+# ============================================================
+# 🗑️ DELETE ENGINE
+# ============================================================
 
 async def process_delete(chat_id, msg_id):
     try:
@@ -97,177 +187,247 @@ async def process_delete(chat_id, msg_id):
 
 
 def schedule_deletion(chat_id, msg_id, duration):
-    """
-    Schedule a message for deletion after `duration` seconds.
-
-    ⏱️ duration comes from ID_DUR in config.py (in seconds).
-    Default is 54000 seconds = 15 hours.
-    """
-    if duration:
-        job_id = f"delete_{uuid.uuid4().hex}"
-        scheduler.add_job(
-            process_delete,
-            'date',
-            run_date=datetime.now() + timedelta(seconds=duration),
-            args=[chat_id, msg_id],
-            id=job_id,
-            misfire_grace_time=300  # allow up to 5 min late execution
-        )
-        logger.debug(f"⏰ Scheduled deletion of {msg_id} in {duration}s (Job: {job_id})")
+    job_id = f"delete_{uuid.uuid4().hex}"
+    scheduler.add_job(
+        process_delete,
+        'date',
+        run_date=datetime.now() + timedelta(seconds=duration),
+        args=[chat_id, msg_id],
+        id=job_id,
+        misfire_grace_time=300
+    )
+    logger.debug(f"⏰ Scheduled deletion of {msg_id} in {duration}s (Job: {job_id})")
 
 
-async def handle_messages(client, message, is_new=True, duration=None):
-    """Handler for new messages — schedules them for auto-deletion."""
-    duration = duration or ID_DUR.get(message.chat.id)
-    if duration:
-        schedule_deletion(message.chat.id, message.id, duration)
+def _is_monitored_media(_, __, message):
+    chats = storage.get_all_monitored_chats(_authorized_ids())
+    return message.chat.id in chats
 
 
-async def process_chat_history(chat_id, time_limit):
-    """
-    Scan recent chat history and schedule old messages for deletion.
-
-    Looks back DELETE_WINDOW_HOURS hours (default: 15 hours).
-    """
-    try:
-        duration = ID_DUR.get(chat_id)
-        if not duration:
-            logger.info(f"⚠️ No duration set for chat {chat_id}, skipping history cleanup")
-            return
-
-        message_count = 0
-        processed_ids = set()
-        logger.info(f"🔍 Starting history cleanup for chat {chat_id}...")
-
-        async for msg in user.get_chat_history(chat_id, limit=21000):
-            if not msg.date or msg.date < time_limit:
-                break
-
-            if msg.id in processed_ids:
-                continue
-
-            await handle_messages(user, msg, is_new=False, duration=duration)
-            processed_ids.add(msg.id)
-            message_count += 1
-
-            if message_count % 100 == 0:
-                logger.info(f"📊 Processed {message_count} messages in {chat_id}")
-                await asyncio.sleep(1)
-
-        logger.info(f"✅ Scheduled {message_count} old messages for deletion in {chat_id}")
-
-    except Exception as e:
-        logger.error(f"❌ Failed to process history for {chat_id}: {e}")
+monitored_media_filter = filters.create(_is_monitored_media)
 
 
-async def handle_bot_commands(client, message):
-    cmd = message.command[0].lower()
+async def handle_media_message(client, message):
+    """New MEDIA message in a monitored chat -> schedule it for deletion."""
+    chats = storage.get_all_monitored_chats(_authorized_ids())
+    duration = chats.get(message.chat.id, DEFAULT_DELETE_SECONDS)
+    schedule_deletion(message.chat.id, message.id, duration)
 
-    if cmd == "start":
+
+# ============================================================
+# 📜 COMMANDS
+# ============================================================
+
+async def handle_start(client, message):
+    uid = message.from_user.id if message.from_user else None
+    if uid and is_authorized(uid):
         await message.reply_text(
-            "👋 **Hello! I'm your Group Auto-Cleaner Bot.**\n\n"
-            "🗑️ I automatically **delete all messages** after a set time.\n"
-            f"⏱️ Current delete window: **{DELETE_WINDOW_HOURS} hours**\n"
-            "✨ Keep your groups **clean, clutter-free, and spam-free!**"
+            "👋 **Hello! I'm your Media Auto-Cleaner Bot.**\n\n"
+            "🗑️ I automatically **delete media messages** (photos, videos, files/documents) "
+            "in the channels & groups you register.\n"
+            "⏱️ Default timer: **4 minutes** — fully customizable per user with /set.\n"
+            "✍️ Text messages are never touched.\n\n"
+            "Use /set to add channels and configure your delete timer."
         )
-
-    elif cmd == "status":
-        uptime = str(datetime.now() - start_time).split('.')[0]
-        active_jobs = len(scheduler.get_jobs())
-
-        cpu_percent = psutil.cpu_percent(interval=1)
-        per_core = psutil.cpu_percent(interval=1, percpu=True)
-        memory = psutil.virtual_memory()
-        swap = psutil.swap_memory()
-        disk = psutil.disk_usage('/')
-        load_avg = psutil.getloadavg() if hasattr(psutil, "getloadavg") else (0, 0, 0)
-        processes = len(psutil.pids())
-
-        status_text = (
-            f"📊 **Bot Status**\n\n"
-            f"⏳ Uptime: `{uptime}`\n"
-            f"⚙️ Active Jobs: `{active_jobs}`\n"
-            f"📌 Monitored Chats: `{len(CHAT_IDS)}`\n"
-            f"🗑️ Delete Window: `{DELETE_WINDOW_HOURS} hours`\n"
-            f"🛡️ Status: `🟢 Running`\n\n"
-            f"💻 **System Stats**\n"
-            f"🔹 CPU Usage: `{cpu_percent}%`\n"
-            f"🔹 Per-Core: `{per_core}`\n"
-            f"🔹 RAM: `{memory.percent}% of {round(memory.total / (1024**3), 2)} GB`\n"
-            f"🔹 Swap: `{swap.percent}% of {round(swap.total / (1024**3), 2)} GB`\n"
-            f"🔹 Disk: `{disk.percent}% of {round(disk.total / (1024**3), 2)} GB`\n"
-            f"🔹 Load Avg (1m,5m,15m): `{load_avg[0]:.2f}, {load_avg[1]:.2f}, {load_avg[2]:.2f}`\n"
-            f"🔹 Processes: `{processes}`"
-        )
-
-        await message.reply_text(status_text)
-
-    elif cmd == "ping":
-        start = datetime.now()
-        msg = await message.reply_text("🏓 Pinging...")
-        latency = (datetime.now() - start).total_seconds()
-        await msg.edit_text(f"🏓 **Pong!**\n⏱️ Latency: `{latency:.3f}s`")
+    else:
+        await message.reply_text(NORMAL_MEMBER_MSG)
 
 
-async def handle_user_commands(client, message):
-    if message.from_user.id != OWNER_ID:
-        logger.warning(f"🚫 Unauthorized command attempt by user {message.from_user.id}")
+async def handle_set(client, message):
+    uid = message.from_user.id
+    if not is_authorized(uid):
+        await message.reply_text(NORMAL_MEMBER_MSG)
+        return
+    text, markup = build_set_menu(uid)
+    await message.reply_text(text, reply_markup=markup)
+
+
+async def handle_status(client, message):
+    uptime = str(datetime.now() - start_time).split('.')[0]
+    active_jobs = len(scheduler.get_jobs())
+    total_chats = len(storage.get_all_monitored_chats(_authorized_ids()))
+    text = (
+        "📊 **Bot Status**\n\n"
+        f"⏳ Uptime: `{uptime}`\n"
+        f"⚙️ Active Jobs: `{active_jobs}`\n"
+        f"📌 Monitored Chats (all users): `{total_chats}`\n"
+        f"🛡️ Status: `🟢 Running`"
+    )
+    await message.reply_text(text)
+
+
+async def handle_ping(client, message):
+    start = datetime.now()
+    msg = await message.reply_text("🏓 Pinging...")
+    latency = (datetime.now() - start).total_seconds()
+    await msg.edit_text(f"🏓 **Pong!**\n⏱️ Latency: `{latency:.3f}s`")
+
+
+async def handle_chats(client, message):
+    uid = message.from_user.id
+    info = storage.get_user(uid)
+    channels = info.get("channels", {})
+    if not channels:
+        await message.reply_text("📌 You haven't set any channels yet. Use /set to add one.")
+        return
+    duration = info.get("duration") or DEFAULT_DELETE_SECONDS
+    lines = [f"{i + 1}. `{cid}` — {title}" for i, (cid, title) in enumerate(channels.items())]
+    text = (
+        f"📌 **Your Monitored Chats ({len(channels)}):**\n" + "\n".join(lines) +
+        f"\n\n⏱ Delete Timer: `{seconds_to_ddhhmmss(duration)}`"
+    )
+    await message.reply_text(text)
+
+
+# ============================================================
+# 🖲️ CALLBACK BUTTONS (/set flow)
+# ============================================================
+
+async def handle_callback(client, callback_query):
+    uid = callback_query.from_user.id
+    if not is_authorized(uid):
+        await callback_query.answer("🚫 You are not authorized.", show_alert=True)
         return
 
-    cmd = message.command[0].lower()
-    logger.info(f"🛠️ Executing command: /{cmd} from owner")
+    data = callback_query.data
 
-    if cmd == "delete":
-        reply = await message.reply_text("🔄 Processing messages...")
-        await delete_messages(reply)
+    if data == "open_manage":
+        text, markup = build_manage_menu()
+        await callback_query.message.edit_text(text, reply_markup=markup)
 
-    elif cmd == "update":
+    elif data == "back_to_set":
+        PENDING.pop(uid, None)
+        text, markup = build_set_menu(uid)
+        await callback_query.message.edit_text(text, reply_markup=markup)
+
+    elif data == "add_channel":
+        PENDING[uid] = "add_channel"
+        text = (
+            "📥 **Add a Channel**\n\n"
+            "Send the channel/group ID, or forward any message from it.\n\n"
+            "⚠️ Make sure the userbot account is already a member "
+            "(admin, so it can delete messages) of that channel/group.\n\n"
+            "Send /cancel to cancel."
+        )
+        await callback_query.message.edit_text(text)
+
+    elif data == "set_time":
+        PENDING[uid] = "set_time"
+        text = (
+            "⏱ **Set Delete Timer**\n\n"
+            "Send the time in format `DD:HH:MM:SS` (Days:Hours:Minutes:Seconds).\n\n"
+            "Examples:\n"
+            "• `00:00:50:00` → 50 minutes\n"
+            "• `03:15:00:25` → 3 days 15 hrs 25 sec\n\n"
+            "Default: `00:00:04:00` (4 minutes)\n\n"
+            "Send /cancel to cancel."
+        )
+        await callback_query.message.edit_text(text)
+
+    elif data.startswith("rm:"):
+        chat_id = data.split(":", 1)[1]
         try:
-            msg = await message.reply_text("📥 Checking for updates...")
-            result = subprocess.run(["git", "pull"], capture_output=True, text=True)
-
-            if result.returncode != 0:
-                await msg.edit_text(f"❌ Update failed:\n```\n{result.stderr}\n```")
-                return
-
-            await msg.edit_text("✅ Update successful! 🔁 Restarting...")
-            os.execl(sys.executable, sys.executable, *sys.argv)
-
+            await storage.remove_channel(uid, chat_id)
         except Exception as e:
-            await message.reply_text(f"💥 Error: `{str(e)}`")
+            logger.error(f"💥 Mongo remove_channel failed: {e}")
+            await callback_query.answer("❌ Database error, try again.", show_alert=True)
+            return
+        text, markup = build_set_menu(uid)
+        await callback_query.message.edit_text(text, reply_markup=markup)
+        await callback_query.answer("✅ Removed")
+        return
 
-    elif cmd == "restart":
-        await message.reply_text("🔁 Restarting bot...")
-        os.execl(sys.executable, sys.executable, *sys.argv)
+    await callback_query.answer()
 
-    elif cmd == "chats":
-        if not CHAT_IDS:
-            await message.reply_text("⚠️ No chats are being monitored.")
+
+# ============================================================
+# ⌨️ PENDING TEXT/FORWARD INPUT (add_channel / set_time replies)
+# ============================================================
+
+def _has_pending_action(_, __, message):
+    return bool(message.from_user) and message.from_user.id in PENDING
+
+
+pending_filter = filters.create(_has_pending_action)
+
+
+async def handle_pending_input(client, message):
+    uid = message.from_user.id
+    action = PENDING.get(uid)
+    if not action:
+        return
+
+    if message.text and message.text.strip().lower() == "/cancel":
+        PENDING.pop(uid, None)
+        await message.reply_text("❌ Cancelled.")
+        return
+
+    if action == "add_channel":
+        chat_id = None
+        title = None
+
+        if message.forward_from_chat:
+            chat_id = message.forward_from_chat.id
+            title = message.forward_from_chat.title or str(chat_id)
+        elif message.text:
+            txt = message.text.strip()
+            try:
+                chat_id = int(txt)
+            except ValueError:
+                await message.reply_text(
+                    "❌ Invalid input. Send a numeric channel/group ID, or forward a message "
+                    "from it. Send /cancel to cancel."
+                )
+                return
         else:
-            text = "📌 **Monitored Chats:**\n" + "\n".join([f"🔐 `{cid}`" for cid in CHAT_IDS])
-            await message.reply_text(text)
+            await message.reply_text(
+                "❌ Please send the channel ID as text, or forward a message from the channel."
+            )
+            return
+
+        try:
+            chat = await user.get_chat(chat_id)
+            title = chat.title or title or str(chat_id)
+            chat_id = chat.id
+        except Exception as e:
+            await message.reply_text(
+                "❌ Couldn't access that chat. Make sure the userbot account is a member "
+                f"of it and the ID is correct.\n`{e}`"
+            )
+            return
+
+        try:
+            await storage.add_channel(uid, chat_id, title)
+        except Exception as e:
+            logger.error(f"💥 Mongo add_channel failed: {e}")
+            await message.reply_text("❌ Database error while saving. Please try again.")
+            return
+        PENDING.pop(uid, None)
+        await message.reply_text(f"✅ Channel **{title}** (`{chat_id}`) added successfully!")
+
+    elif action == "set_time":
+        seconds = parse_ddhhmmss(message.text or "")
+        if seconds is None:
+            await message.reply_text(
+                "❌ Invalid format. Please send time as `DD:HH:MM:SS`.\n"
+                "Example: `00:00:50:00` for 50 minutes.\nSend /cancel to cancel."
+            )
+            return
+        try:
+            await storage.set_duration(uid, seconds)
+        except Exception as e:
+            logger.error(f"💥 Mongo set_duration failed: {e}")
+            await message.reply_text("❌ Database error while saving. Please try again.")
+            return
+        PENDING.pop(uid, None)
+        await message.reply_text(
+            f"✅ Delete timer set to `{seconds_to_ddhhmmss(seconds)}` ({seconds} seconds)."
+        )
 
 
-async def delete_messages(reply=None):
-    """
-    Main cleanup function — scans history of all monitored chats
-    and schedules messages older than DELETE_WINDOW_HOURS for deletion.
-
-    ⏱️ DELETE_WINDOW_HOURS is set at the top of this file (default: 15).
-    """
-    # ── ⏱️ TIME WINDOW FOR HISTORY CLEANUP ──────────────────────────────
-    # This line controls how far back we look in chat history.
-    # Change DELETE_WINDOW_HOURS (top of file) to adjust.
-    time_limit = datetime.now() - timedelta(hours=DELETE_WINDOW_HOURS)
-    # ─────────────────────────────────────────────────────────────────────
-
-    tasks = [process_chat_history(chat_id, time_limit) for chat_id in CHAT_IDS]
-    await asyncio.gather(*tasks, return_exceptions=True)
-
-    if reply:
-        queue_size = sum(1 for job in scheduler.get_jobs() if job.id.startswith("delete_"))
-        await reply.edit_text(f"✅ Cleanup complete! 📦 {queue_size} deletions scheduled.")
-
+# ============================================================
+# 💓 HEARTBEAT
+# ============================================================
 
 async def heartbeat():
     while not shutdown_event.is_set():
@@ -281,8 +441,12 @@ async def heartbeat():
             await asyncio.sleep(60)
 
 
+# ============================================================
+# 🚀 MAIN
+# ============================================================
+
 async def main():
-    global app, user, scheduler, shutdown_event, OWNER_ID
+    global app, user, scheduler, shutdown_event
 
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
@@ -290,63 +454,68 @@ async def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda: shutdown_event.set())
 
-    # APScheduler — do NOT pass event_loop (deprecated in APScheduler 3.x + Python 3.10+)
     scheduler = AsyncIOScheduler()
     scheduler.start()
-    scheduler.add_job(delete_messages, 'interval', minutes=4, id="regular_cleanup")
-    logger.info("⏰ Scheduler started with regular cleanup every 4 minutes.")
+    logger.info("⏰ Scheduler started.")
 
-    app = Client("AutoWiperBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-    user = Client("UserAutoWiper", api_id=API_ID, api_hash=API_HASH, session_string=SESSION)
+    try:
+        await storage.init_cache()
+        logger.info("🍃 MongoDB cache loaded into memory.")
+    except Exception as e:
+        logger.error(f"💥 Failed to load MongoDB cache: {e} — check MONGO_URI. Starting with empty cache.")
 
+    app = Client("AutoWiperBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
+    user = Client("UserAutoWiper", api_id=API_ID, api_hash=API_HASH, session_string=SESSION,
+                  in_memory=True, no_updates=False)
+
+    # ── Bot (app) commands — all handled in private chat ──
+    app.add_handler(MessageHandler(handle_start, filters=filters.command(["start"]) & filters.private))
+    app.add_handler(MessageHandler(handle_set, filters=filters.command(["set"]) & filters.private))
+    app.add_handler(MessageHandler(handle_status, filters=filters.command(["status"]) & filters.private))
+    app.add_handler(MessageHandler(handle_ping, filters=filters.command(["ping"]) & filters.private))
+    app.add_handler(MessageHandler(handle_chats, filters=filters.command(["chats"]) & filters.private))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    # Catches replies (channel ID / forward / time) while a /set flow is in progress.
     app.add_handler(MessageHandler(
-        handle_bot_commands,
-        filters=filters.command(["start", "status", "ping"]) & filters.private
+        handle_pending_input,
+        filters=filters.private & pending_filter &
+                ~filters.command(["start", "set", "status", "ping", "chats"])
     ))
 
+    # ── Userbot (user) — watches monitored chats for media to auto-delete ──
     user.add_handler(MessageHandler(
-        handle_messages,
-        filters=filters.chat(CHAT_IDS) & ~filters.pinned_message
-    ))
-
-    user.add_handler(MessageHandler(
-        handle_user_commands,
-        filters.private & filters.command(["delete", "update", "restart", "chats"])
+        handle_media_message,
+        filters=filters.media & monitored_media_filter & ~filters.pinned_message
     ))
 
     await app.start()
     await user.start()
 
     me = await user.get_me()
-    OWNER_ID = me.id
-    logger.info(f"🎯 Owner ID auto-set to: {OWNER_ID} (@{me.username or 'Unknown'})")
+    logger.info(f"🎯 Userbot running as: {me.id} (@{me.username or 'Unknown'})")
 
     try:
         await user.send_message(
             me.id,
             "✅ **Auto-Cleaner Bot Started!**\n\n"
-            f"📊 Monitoring: `{len(CHAT_IDS)}` groups\n"
-            f"🗑️ Auto-delete: every `{DELETE_WINDOW_HOURS}` hours\n"
-            f"🛠️ Admin commands active for you only.\n"
-            f"ℹ️ Use `/status`, `/chats`, `/delete` as needed."
+            f"👑 Owners: `{len(OWNER_IDS)}` | 🔑 Auth Users: `{len(AUTH_USERS)}`\n"
+            f"📊 Monitoring: `{len(storage.get_all_monitored_chats(_authorized_ids()))}` chats\n"
+            f"🗑️ Auto-delete: **media only**, per-user configurable timer (default 4 min)\n"
+            f"✍️ Text messages are never deleted."
         )
     except Exception as e:
         logger.error(f"📩 Failed to send startup message: {e}")
 
     heartbeat_task = loop.create_task(heartbeat())
 
+    logger.info("🚀 Bot is now running! 🌐")
+    if not OWNER_IDS and not AUTH_USERS:
+        logger.warning("⚠️ No OWNER_IDS / AUTH_USERS configured — nobody can use /set yet.")
+
     try:
-        await delete_messages()
-        logger.info("🚀 Bot is now running! 🌐")
-
-        if not CHAT_IDS:
-            logger.warning("⚠️ No CHAT_IDS configured — bot will not monitor any chats.")
-
         await shutdown_event.wait()
-
     except Exception as e:
         logger.error(f"💥 Critical error: {e}")
-
     finally:
         logger.info("🛑 Shutting down gracefully...")
 
@@ -371,7 +540,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Start Flask web server in background thread (required for Render.com)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info(f"🌐 Flask web server started on port {FLASK_PORT}")
