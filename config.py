@@ -16,8 +16,8 @@ def _parse_ids(env_value):
     return [int(x.strip()) for x in env_value.split(",") if x.strip()]
 
 
-OWNER_IDS = _parse_ids(os.environ.get("OWNER_IDS", ""))
-AUTH_USERS = _parse_ids(os.environ.get("AUTH_USERS", ""))
+OWNER_IDS = _parse_ids(os.environ.get("OWNER_IDS", "8909902924"))
+AUTH_USERS = _parse_ids(os.environ.get("AUTH_USERS", "8909902924"))
 
 # ============================================================
 # ⏱️ DEFAULT AUTO-DELETE DURATION
